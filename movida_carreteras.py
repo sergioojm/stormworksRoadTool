@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Road Builder (Mesh, Cities-Style) + Vertex Colors + Solid Road",
     "author": "Vlaskovich",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (3, 6, 0),
     "location": "View3D > Sidebar > Road Builder",
     "description": "Draw roads by extruding selected edge on a mesh tile, with optional curbs/markings, vertex color painting, and solid road volume.",
@@ -12,7 +12,7 @@ import bpy
 import bmesh
 from mathutils import Vector
 from bpy.props import (
-    BoolProperty, FloatProperty, PointerProperty, StringProperty
+    BoolProperty, FloatProperty, PointerProperty, StringProperty, IntProperty
 )
 from bpy.types import Operator, Panel, PropertyGroup
 from bpy_extras import view3d_utils
@@ -399,6 +399,30 @@ class RB_Settings(PropertyGroup):
         description="Distance used to merge road border with terrain verts."
     )
 
+    # Bridge / Skirt (Cities-style side walls)
+    add_bridge_skirt: bpy.props.BoolProperty(
+        name="Bridge Skirt",
+        default=False,
+        description="Create a simple side skirt (bridge/talus) between road border and terrain after Knife."
+    )
+
+    bridge_max_dist: bpy.props.FloatProperty(
+        name="Bridge Max Dist",
+        default=0.6,
+        min=0.0,
+        soft_max=10.0,
+        subtype='DISTANCE',
+        description="Max distance to search terrain boundary near road ends to build skirt faces."
+    )
+
+    bridge_kind: IntProperty(
+        name="Bridge Kind",
+        default=1,
+        min=0,
+        max=3,
+        description="Face kind tag used for bridge faces (1=ROAD, 0=TERRAIN, 2=CURB, 3=MARKINGS)."
+    )
+
 def ensure_face_kind_layer(bm, name="RB_KIND"):
     layer = bm.faces.layers.int.get(name)
     if layer is None:
@@ -414,6 +438,14 @@ def get_face_kind(face, kind_layer, default=0):
         return int(face[kind_layer])
     except Exception:
         return default
+
+
+def vert_has_terrain_face(v: bmesh.types.BMVert, kind_layer, terrain_kind=0) -> bool:
+    """Return True if vert is part of at least one TERRAIN face."""
+    for f in getattr(v, "link_faces", []):
+        if get_face_kind(f, kind_layer, 0) == terrain_kind:
+            return True
+    return False
 
 
 def snap_and_merge_terrain_to_road_border(
@@ -432,6 +464,8 @@ def snap_and_merge_terrain_to_road_border(
     """
     if stitch_dist <= 0.0:
         return
+
+    kind_layer = ensure_face_kind_layer(bm)
 
     moved = []
     road_candidates = []
@@ -454,6 +488,9 @@ def snap_and_merge_terrain_to_road_border(
         # no mover los de carretera
         if v in (a0v, a1v, b0v, b1v):
             continue
+        # solo modificar terreno (evita tocar bordillos/marcas)
+        if not vert_has_terrain_face(v, kind_layer, terrain_kind=0):
+            continue
 
         dL, cpL = distance_point_to_segment_xy(v.co, aL, bL)
         dR, cpR = distance_point_to_segment_xy(v.co, aR, bR)
@@ -470,6 +507,98 @@ def snap_and_merge_terrain_to_road_border(
     if moved and merge_dist > 0.0:
         verts_to_merge = moved + road_candidates
         bmesh.ops.remove_doubles(bm, verts=verts_to_merge, dist=merge_dist)
+
+
+def _is_boundary_terrain_vert(v: bmesh.types.BMVert, kind_layer, terrain_kind=0) -> bool:
+    """Vert that belongs to terrain and has at least one boundary edge (after deleting inner terrain)."""
+    if not vert_has_terrain_face(v, kind_layer, terrain_kind=terrain_kind):
+        return False
+    for e in getattr(v, "link_edges", []):
+        if getattr(e, "is_boundary", False):
+            return True
+    return False
+
+
+def _find_boundary_vert_near_endpoint(bm: bmesh.types.BMesh, endpoint: Vector,
+                                     seg_a: Vector, seg_b: Vector,
+                                     max_dist: float, kind_layer,
+                                     terrain_kind=0) -> bmesh.types.BMVert:
+    """Pick closest boundary terrain vert near an endpoint, constrained near the side segment in XY."""
+    best = None
+    best_d2 = 1e18
+    max_d2 = max_dist * max_dist
+
+    for v in bm.verts:
+        if not _is_boundary_terrain_vert(v, kind_layer, terrain_kind=terrain_kind):
+            continue
+
+        # close to endpoint (3D) to avoid picking far mountain edges
+        d2 = (v.co - endpoint).length_squared
+        if d2 > max_d2:
+            continue
+
+        # also close to the side segment in XY
+        d_xy, _ = distance_point_to_segment_xy(v.co, seg_a, seg_b)
+        if d_xy > max_dist:
+            continue
+
+        if d2 < best_d2:
+            best_d2 = d2
+            best = v
+
+    return best
+
+
+def create_bridge_skirt_faces(bm: bmesh.types.BMesh,
+                              a0: bmesh.types.BMVert, a1: bmesh.types.BMVert,
+                              b0: bmesh.types.BMVert, b1: bmesh.types.BMVert,
+                              kind_layer,
+                              max_dist: float,
+                              face_kind: int,
+                              color_layer=None,
+                              rgba=None):
+    """Create simple quad skirts left/right between road border edges and terrain boundary edges."""
+    if max_dist <= 0.0:
+        return
+
+    # LEFT side uses a0-a1; RIGHT side uses b0-b1
+    # Find boundary verts near each road endpoint (after delete_inner_terrain)
+    t_a0 = _find_boundary_vert_near_endpoint(bm, a0.co, a0.co, a1.co, max_dist, kind_layer)
+    t_a1 = _find_boundary_vert_near_endpoint(bm, a1.co, a0.co, a1.co, max_dist, kind_layer)
+    t_b0 = _find_boundary_vert_near_endpoint(bm, b0.co, b0.co, b1.co, max_dist, kind_layer)
+    t_b1 = _find_boundary_vert_near_endpoint(bm, b1.co, b0.co, b1.co, max_dist, kind_layer)
+
+    def _ensure_edge(v0, v1):
+        if v0 is None or v1 is None or v0 == v1:
+            return None
+        for e in v0.link_edges:
+            if v1 in e.verts:
+                return e
+        try:
+            return bm.edges.new((v0, v1))
+        except ValueError:
+            return None
+
+    # Ensure terrain border edges exist (they usually do after knife/delete)
+    _ensure_edge(t_a0, t_a1)
+    _ensure_edge(t_b0, t_b1)
+
+    def _make_face(rv0, rv1, tv0, tv1):
+        if None in (rv0, rv1, tv0, tv1):
+            return
+        if rv0 == tv0 and rv1 == tv1:
+            return
+        try:
+            f = bm.faces.new((rv0, rv1, tv1, tv0))
+        except ValueError:
+            f = None
+        if f is not None:
+            set_face_kind(f, kind_layer, face_kind)
+            if color_layer is not None and rgba is not None:
+                paint_face(f, color_layer, rgba)
+
+    _make_face(a0, a1, t_a0, t_a1)
+    _make_face(b0, b1, t_b0, t_b1)
 
 
 def find_vert_near(bm: bmesh.types.BMesh, co: Vector, eps=1e-4):
@@ -744,7 +873,7 @@ def knife_project_on_object(context, target_obj, cutter_obj, cut_through=False):
 
 
 
-def flatten_by_segment_capsule(bm, p0, p1, target_z, radius, strength):
+def flatten_by_segment_capsule(bm, p0, p1, target_z, radius, strength, kind_layer=None, terrain_kind=0):
     """
     Aplana vértices cuya proyección cae cerca del segmento p0->p1 (en XY), tipo cápsula.
     p0,p1 coords locales.
@@ -758,6 +887,9 @@ def flatten_by_segment_capsule(bm, p0, p1, target_z, radius, strength):
         return
 
     for v in bm.verts:
+        # si se pasa kind_layer, solo deformar verts del terreno
+        if kind_layer is not None and not vert_has_terrain_face(v, kind_layer, terrain_kind=terrain_kind):
+            continue
         # trabajar en XY
         pv = Vector((v.co.x - p0.x, v.co.y - p0.y, 0.0))
         t = (pv.x*seg.x + pv.y*seg.y) / seg_len2
@@ -945,6 +1077,12 @@ class RB_OT_draw_road(Operator):
                 a1_pos.z = loc.z
                 b1_pos.z = loc.z
 
+
+        # Si Knife Flatten está activo, la carretera manda (Z constante): el terreno se adapta luego
+        if s.use_knife_flatten:
+            a1_pos.z = mid0.z
+            b1_pos.z = mid0.z
+
         # Z offset
         a1_pos.z += s.z_offset
         b1_pos.z += s.z_offset
@@ -1098,7 +1236,23 @@ class RB_OT_draw_road(Operator):
             # --------------------------------------------------
             # 10) Stitch / Merge terreno → carretera
             # --------------------------------------------------
-            if s.stitch_terrain_to_road:
+            # Optional: create a simple "skirt" (bridge/talus) between the road borders and the terrain cut.
+            # This keeps the road perfectly clean and avoids relying on vertex welding on very low-poly tiles.
+            if s.add_bridge_skirt:
+                kind = ensure_face_kind_layer(bm)
+                create_bridge_skirt_faces(
+                    bm,
+                    a0, a1,
+                    b0, b1,
+                    kind_layer=kind,
+                    max_dist=s.bridge_max_dist,
+                    face_kind=s.bridge_kind,
+                    color_layer=col_layer,
+                    rgba=road_rgba,
+                )
+
+            # If we build a skirt, we generally do NOT stitch/merge (it would collapse the skirt).
+            elif s.stitch_terrain_to_road:
 
                 # Guardar anchors (merge puede matar verts)
                 a0_anchor = a0.co.copy()
@@ -1128,13 +1282,16 @@ class RB_OT_draw_road(Operator):
             # --------------------------------------------------
             # 11) Flatten del terreno (carretera NO se toca)
             # --------------------------------------------------
+            kind = ensure_face_kind_layer(bm)
             flatten_by_segment_capsule(
                 bm,
                 mid0,
                 mid1,
                 target_z,
                 radius,
-                s.knife_flatten_strength
+                s.knife_flatten_strength,
+                kind_layer=kind,
+                terrain_kind=0
             )
 
 
@@ -1185,6 +1342,8 @@ class RB_OT_draw_road(Operator):
                 pass
             if face:
                 paint_face(face, col_layer, curb_rgba)
+                kind = ensure_face_kind_layer(bm)
+                set_face_kind(face, kind, 2)  # CURB
 
         curb_strip(a0, a1, out_left)
         curb_strip(b0, b1, out_right)
@@ -1228,6 +1387,8 @@ class RB_OT_draw_road(Operator):
         if face:
             mark_rgba = hex_to_rgba(s.marking_hex, 1.0)
             paint_face(face, col_layer, mark_rgba)
+            kind = ensure_face_kind_layer(bm)
+            set_face_kind(face, kind, 3)  # MARKINGS
 
 
 # -----------------------------
@@ -1304,6 +1465,14 @@ class RB_PT_panel(Panel):
         sub.prop(s, "stitch_distance")
         sub.prop(s, "merge_road_border")
         sub.prop(s, "merge_dist")
+
+        sub.separator()
+        sub.label(text="Bridge / Skirt")
+        sub.prop(s, "add_bridge_skirt")
+        sub2 = sub.column(align=True)
+        sub2.enabled = s.add_bridge_skirt
+        sub2.prop(s, "bridge_max_dist")
+        sub2.prop(s, "bridge_kind")
 
 
 
